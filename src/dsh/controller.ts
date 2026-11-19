@@ -1009,8 +1009,14 @@ export class ChatController implements vscode.Disposable {
    * 「会话 header 的 cwd == 工作区路径」**且**「会话在注册表的 sessionIds 里」，
    * 后半条只有 `session/create` 带 `workspaceId` 时才会发生。缓存它避免每次
    * 新建会话都发一次注册请求；换个服务器（新 client）时清空重取。
+   *
+   * **缓存连同它注册时的路径一起记**（`workspaceIdPath`，`normalizePath` 键）：多根工作区里
+   * 当前根会变（用户换根、所选的根被移出工作区后回退到第一个），旧根的 id 绝不能拿去给新根
+   * 建会话——那会让首条消息落回旧目录。命中的判据是「路径相同」，不是「有没有缓存」。
    */
   private workspaceId: string | undefined;
+  /** `workspaceId` 对应的工作区路径（`normalizePath` 键），见上。 */
+  private workspaceIdPath: string | undefined;
   /**
    * 用户在新会话页上选定的工作目录（**只在 VS Code 没有打开文件夹时有意义**）。
    *
@@ -3314,6 +3320,7 @@ export class ChatController implements vscode.Disposable {
       // 工作区 id 是**服务端注册表**里的东西：换了服务器（或注册表被重置）时
       // 旧 id 会 `workspace/not-found`，所以每次新建 client 都重新解析一次
       this.workspaceId = undefined;
+      this.workspaceIdPath = undefined;
       client.connect();
       await this.loadModels();
       await this.refreshSessions();
@@ -3675,6 +3682,15 @@ export class ChatController implements vscode.Disposable {
     if (!this.client) return;
     await this.refreshSessions();
     await this.adoptBlankForUnboundViews();
+    // 绑着**空壳**、而空壳的目录已不是当前根的窗口（典型：所选的根 B 被移出工作区，当前根
+    // 回退到 A）：换到当前根那条壳，否则首条消息仍落在已移除的 B。说过话的会话不动。
+    // 这是自动路径，不拉起后台（`start: false`），恢复未结算的窗口让位（同 `adoptBlankForUnboundViews`）。
+    // 文件夹全关了不做：那时没有「当前根」，解绑只会把窗口打回无目录的空态。
+    if (!vscode.workspace.workspaceFolders?.length) return;
+    for (const [viewId, sessionId] of [...this.viewSessions]) {
+      if (this.hasRestorePending(viewId) || !this.isBlankShell(sessionId)) continue;
+      await this.rebindWorkspaceDir(viewId, false);
+    }
   }
 
   /**
@@ -5195,23 +5211,29 @@ export class ChatController implements vscode.Disposable {
    * 而不是抛错**：会话照旧按 cwd 建得出来，只是那一条在 Web 端仍落在未分组里——
    * 让「新建会话」整体失败是更糟的结果。失败原因进日志。
    */
-  private async ensureWorkspace(): Promise<string | undefined> {
-    if (this.workspaceId) return this.workspaceId;
+  private async ensureWorkspace(targetPath: string): Promise<string | undefined> {
     if (!this.client) return undefined;
     // 只有**VS Code 打开的文件夹**才注册成工作区：没有文件夹时用户挑的那个目录
     // （`newSessionCwd`）只是个落脚点，把它注册进服务端的工作区注册表是另一回事
     // （那会长期留在 Web 的侧栏里），会话按 cwd 建、落在「未分组」——与用户口径
     // 「和以前一样，是未分组会话」一致。
     // 工作区外的目录（`outsideRoot`）同样不注册，理由见它的字段注释
-    if (this.outsideRoot) return undefined;
-    const folder = this.rootFolder();
+    //
+    // 判据按**这次要落壳的那个目录**（调用方的快照）算：它是工作区里的某个根才注册，
+    // 否则（工作区外目录 / 没打开文件夹 / 根在快照之后被移走）按 cwd 建。
+    const key = normalizePath(targetPath);
+    const folder = (vscode.workspace.workspaceFolders ?? []).find((item) => normalizePath(item.uri.fsPath) === key);
     if (!folder) return undefined;
+    if (this.workspaceId && this.workspaceIdPath === key) return this.workspaceId;
+    this.workspaceId = undefined;
+    this.workspaceIdPath = undefined;
     const path = folder.uri.fsPath;
     try {
       const value = await this.client.createWorkspace(path);
       const id = value?.workspace?.workspaceId;
       if (typeof id === "string" && id) {
         this.workspaceId = id;
+        this.workspaceIdPath = key;
         this.log(`[workspace] 工作区已注册：${path} → ${id}`);
         return id;
       }
@@ -5455,20 +5477,24 @@ export class ChatController implements vscode.Disposable {
     if (!this.client) return undefined;
     try {
       const preset = this.agentPresetFor(viewId);
-      const workspaceId = await this.ensureWorkspace();
+      // **目标目录只取一次快照**：注册、复用扫描、新建三处用同一个目录。`ensureWorkspace`
+      // 是往返，期间用户可能换了根 / 根被移出工作区——那时再各自读 `workspacePath()`，
+      // 就会出现「拿 B 的 workspaceId 给 A 建壳」这种拼接（首条消息落回旧目录）。
+      const targetPath = this.workspacePath();
+      const workspaceId = await this.ensureWorkspace(targetPath);
       // 闸按**目录**分：同一个目录里同时进空态的窗口排成一队，后到的在闸内重新扫列表
-      const gateKey = normalizePath(this.workspacePath());
+      const gateKey = normalizePath(targetPath);
       const created = await this.withBlankGate(gateKey, async () => {
         // 扫描前先确保手里有一份列表：`reusableBlank` 扫的就是 `this.sessions`，而它可能
         // 还没拉过（窗口刚就绪、恢复路径没走到）——空着扫会把**别的窗口建好的壳**漏掉，
         // 于是又建一条
         if (!this.sessions.length) await this.refreshSessions();
-        const reusable = this.reusableBlank();
+        const reusable = this.reusableBlank(targetPath);
         if (reusable !== undefined) this.log(`[new] 窗口=${viewId} 复用空壳 ${reusable}`);
         const result =
           reusable !== undefined
             ? await this.adoptBlankShell(reusable)
-            : await this.createSessionInWorkspace(workspaceId, preset);
+            : await this.createSessionInWorkspace(workspaceId, preset, targetPath);
         // 新壳要出现在 `this.sessions` 里才找得到（`reusableBlank` 扫的就是它），本地 blank
         // 位也在这里与服务端对齐一次。放在闸内：排队的那几个窗口要靠这份列表看到它
         await this.refreshSessions();
@@ -5573,18 +5599,21 @@ export class ChatController implements vscode.Disposable {
   private async createSessionInWorkspace(
     workspaceId: string | undefined,
     agentPreset: string | undefined,
+    /** 这次落壳的目标目录（调用方的快照，见 `reuseOrCreateBlank`）。 */
+    targetPath: string = this.workspacePath(),
   ): Promise<{ sessionId: string; agentPreset?: string }> {
     if (!this.client) throw new Error("no client");
     // 预设只在**创建时**能指定（之后换要走 `agentPresets/select`，且只在会话还没有
     // 轮次时有效）。没有就不传这个字段——服务端按它自己的默认预设组装。
     const target = agentPreset ? { agentPreset } : {};
-    if (!workspaceId) return this.client.createSession({ cwd: this.workspacePath(), ...target });
+    if (!workspaceId) return this.client.createSession({ cwd: targetPath, ...target });
     try {
       return await this.client.createSession({ workspaceId, ...target });
     } catch (error) {
       this.workspaceId = undefined;
+      this.workspaceIdPath = undefined;
       this.log(`[workspace] 按工作区建会话失败，回退 cwd：${this.describeError(error)}`);
-      return this.client.createSession({ cwd: this.workspacePath(), ...target });
+      return this.client.createSession({ cwd: targetPath, ...target });
     }
   }
 
@@ -5686,8 +5715,8 @@ export class ChatController implements vscode.Disposable {
    *
    * 找不到就返回 undefined，调用方照常 `session/create`。
    */
-  private reusableBlank(): string | undefined {
-    const target = normalizePath(this.workspacePath());
+  private reusableBlank(targetPath: string = this.workspacePath()): string | undefined {
+    const target = normalizePath(targetPath);
     for (const row of this.sessions) {
       if (row.blank !== true) continue;
       if (this.engagedSessions.has(row.id)) continue;
@@ -5887,7 +5916,11 @@ export class ChatController implements vscode.Disposable {
 
   /** 根目录换过之后的连带动作（见 `switchRoot`）：清注册缓存、推目录提示、重拉历史、落到新根的空壳。 */
   private async afterRootChanged(viewId: string): Promise<void> {
-    this.workspaceId = undefined;
+    // **第一次让出之前**先把旧壳解绑（同步）：界面帧是独立处理的，拉列表那段往返里用户
+    // 紧接着按发送，若窗口还绑着旧目录的空壳，首条消息就进了旧目录。解绑之后，这期间的
+    // 发送走 `ensureSession` 落到**新**目录（与下面的补壳合并成同一次尝试，见 `sessionEnsures`）。
+    // 注册缓存不必在这里清：它按路径命中（见 `workspaceIdPath`）。
+    this.detachStaleBlank(viewId);
     this.refreshWorkspace();
     if (this.client) await this.refreshSessions();
     await this.rebindWorkspaceDir(viewId);
@@ -5912,17 +5945,31 @@ export class ChatController implements vscode.Disposable {
    *   本来也不在空态页上——空态页只在没有消息时渲染）。判据按肯定证据写：**拿不到
    *   「它是空壳」的证据就不动手**（`isBlankShell` 对查不到的会话返回 false）。
    */
-  private async rebindWorkspaceDir(viewId: string): Promise<void> {
+  private async rebindWorkspaceDir(viewId: string, start = true): Promise<void> {
     const bound = this.viewSessions.get(viewId);
     if (bound !== undefined) {
       if (!this.isBlankShell(bound)) return;
-      // 空壳一定在 `this.sessions` 里（`isBlankShell` 就是查它），所以这里读得到 cwd
-      const row = this.sessions.find((item) => item.id === bound);
-      if (row && normalizePath(row.cwd) === normalizePath(this.workspacePath())) return;
-      this.detachView(viewId);
-      this.emitToView(viewId, { type: "state", state: this.snapshotFor(viewId) });
+      if (!this.detachStaleBlank(viewId)) return;
     }
-    await this.ensureSession(viewId, { start: true, askDir: false });
+    await this.ensureSession(viewId, { start, askDir: false });
+  }
+
+  /**
+   * 窗口绑着的是**目录与当前工作目录不同的空壳**时，同步解绑并推一帧空态（`rebindWorkspaceDir`
+   * 的前半段，单独拿出来是为了能在第一次 `await` 之前做完，见 `afterRootChanged`）。
+   *
+   * @returns 解绑了（或本来就没绑）→ true；绑着的是说过话的会话、或空壳目录本来就对 → false。
+   */
+  private detachStaleBlank(viewId: string): boolean {
+    const bound = this.viewSessions.get(viewId);
+    if (bound === undefined) return true;
+    if (!this.isBlankShell(bound)) return false;
+    // 空壳一定在 `this.sessions` 里（`isBlankShell` 就是查它），所以这里读得到 cwd
+    const row = this.sessions.find((item) => item.id === bound);
+    if (row && normalizePath(row.cwd) === normalizePath(this.workspacePath())) return false;
+    this.detachView(viewId);
+    this.emitToView(viewId, { type: "state", state: this.snapshotFor(viewId) });
+    return true;
   }
 
   /**

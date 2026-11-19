@@ -562,4 +562,89 @@ console.log("workspaceDirRepick: 空态页的目录胶囊能反复改目录（�
   }
 }
 
+// ---------- 十、所选的根被移出工作区：首条消息落回第一个根，不落在已移除的根 ----------
+//
+// 选中并注册了 B 之后，VS Code 把 B 移出工作区，当前根回退到 A。两条都不能落回 B：
+// 绑着 B 空壳的窗口要换到 A 的壳；新窗口建壳时不能复用 B 的 `workspaceId`（注册缓存按路径命中）。
+{
+  const workspace = vscode.workspace as unknown as { workspaceFolders: unknown };
+  const originalFolders = workspace.workspaceFolders;
+  workspace.workspaceFolders = [{ uri: { fsPath: DIR_A } }, { uri: { fsPath: DIR_B } }];
+  try {
+    const { c, client } = makeHarness();
+    const ctl = c as unknown as { applyWorkspaceFoldersChange(): Promise<void> };
+    c.bindView("v1");
+    await c.handle({ type: "switchRoot", path: DIR_B }, "v1");
+    assert.strictEqual(cwdOf(client, c.viewSessions.get("v1")), DIR_B, "前提：窗口落在 B 的空壳上");
+    assert.deepStrictEqual(client.workspaces, [DIR_B], "前提：B 已注册");
+
+    workspace.workspaceFolders = [{ uri: { fsPath: DIR_A } }];
+    await ctl.applyWorkspaceFoldersChange();
+    await sendMessage(c, "v1", "第一条");
+    const first = client.prompts.at(-1)?.sessionId;
+    console.log(`  移除 B 后发送 → 会话 ${first} cwd=${cwdOf(client, first)}`);
+    assert.strictEqual(cwdOf(client, first), DIR_A, "绑着 B 空壳的窗口：首条消息落在 A，不落在已移除的 B");
+
+    c.bindView("v2");
+    await sendMessage(c, "v2", "另一个窗口");
+    const second = client.prompts.at(-1)?.sessionId;
+    assert.notStrictEqual(second, first, "前提：v2 是另一条新会话");
+    assert.strictEqual(cwdOf(client, second), DIR_A, "新窗口建壳：不复用 B 的 workspaceId，落在 A");
+    assert.ok(client.rows.every((row) => row.cwd !== DIR_B || row.blank), "B 里没有任何会话收到消息");
+  } finally {
+    workspace.workspaceFolders = originalFolders;
+  }
+}
+
+// ---------- 十一、切根后立即发送：列表请求还没回来，首条消息也落在新根 ----------
+//
+// 切根要拉一次历史列表（往返）。往返期间用户紧接着按发送：窗口若还绑着旧根的空壳，
+// 首条消息就进了旧目录。旧壳必须在第一次让出之前解绑。
+{
+  const workspace = vscode.workspace as unknown as { workspaceFolders: unknown };
+  const originalFolders = workspace.workspaceFolders;
+  workspace.workspaceFolders = [{ uri: { fsPath: DIR_A } }, { uri: { fsPath: DIR_B } }];
+  try {
+    const { c, client } = makeHarness();
+    const ctl = c as unknown as {
+      ensureSession(viewId: string, options: { start: boolean; askDir: boolean }): Promise<unknown>;
+    };
+    c.bindView("v1");
+    await ctl.ensureSession("v1", { start: false, askDir: false });
+    assert.strictEqual(cwdOf(client, c.viewSessions.get("v1")), DIR_A, "前提：窗口落在 A 的空壳上");
+
+    // 挂起列表请求：切根那趟卡在 `refreshSessions`
+    const list = client.listSessions;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let listed!: () => void;
+    const listedOnce = new Promise<void>((resolve) => {
+      listed = resolve;
+    });
+    client.listSessions = async () => {
+      listed();
+      await gate;
+      return list();
+    };
+    const switching = c.handle({ type: "switchRoot", path: DIR_B }, "v1");
+    await listedOnce;
+    const sending = sendMessage(c, "v1", "切完马上发");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    release();
+    await switching;
+    await sending;
+    client.listSessions = list;
+
+    assert.strictEqual(client.prompts.length, 1, "只发出一条");
+    const target = client.prompts[0].sessionId;
+    console.log(`  切到 B 后立即发送 → 会话 ${target} cwd=${cwdOf(client, target)}`);
+    assert.strictEqual(cwdOf(client, target), DIR_B, "首条消息落在新根 B，不落在 A 的旧壳");
+    assert.strictEqual(cwdOf(client, c.viewSessions.get("v1")), DIR_B, "窗口最终绑在 B 的会话上");
+  } finally {
+    workspace.workspaceFolders = originalFolders;
+  }
+}
+
 console.log("workspaceDirRepick: 目录胶囊每次都弹框、换目录真的换到新目录那条壳上（含先切后建与换回复用）✓");
